@@ -1,0 +1,5 @@
+python-telegram-bot==20.5
+playwright==1.38.0
+2captcha-python==1.2.1
+python-dotenv==1.0.0
+requests==2.31.0
