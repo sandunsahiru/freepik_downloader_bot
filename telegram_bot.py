@@ -53,19 +53,40 @@ def init_bot(token, url_pattern, max_queue_size=10, queue=None, active_downloads
     BANK_DETAILS = bank_details or {}
     ADMIN_CHAT_IDS = admin_chat_ids or []
     
-    async def setup_commands(bot):
-        """Set up command menu buttons for the bot."""
-        logger.info("Setting up command menu buttons...")
-        commands = [
-            BotCommand("start", "Start or restart the bot"),
-            BotCommand("info", "View your account information"),
-            BotCommand("freepik", "Download Freepik resources"),
-            BotCommand("subscriptions", "Manage your subscriptions"),
-            BotCommand("status", "Check download status"),
-            BotCommand("help", "Get help with using the bot")
-        ]
-        await bot.set_my_commands(commands)
-        logger.info("Command menu buttons set up successfully")
+    # Use provided resources if available
+    if queue is not None:
+        download_queue = queue
+    else:
+        download_queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
+        
+    if active_downloads_dict is not None:
+        active_downloads = active_downloads_dict
+    else:
+        active_downloads = {}
+        
+    if lock is not None:
+        queue_lock = lock
+    else:
+        queue_lock = threading.Lock()
+        
+    if database is not None:
+        db = database
+    
+    return download_queue, active_downloads, queue_lock
+
+async def setup_commands(bot):
+    """Set up command menu buttons for the bot."""
+    logger.info("Setting up command menu buttons...")
+    commands = [
+        BotCommand("start", "Start or restart the bot"),
+        BotCommand("info", "View your account information"),
+        BotCommand("freepik", "Download Freepik resources"),
+        BotCommand("subscriptions", "Manage your subscriptions"),
+        BotCommand("status", "Check download status"),
+        BotCommand("help", "Get help with using the bot")
+    ]
+    await bot.set_my_commands(commands)
+    logger.info("Command menu buttons set up successfully")
 
 # Then call this in your run_bot function:
 async def run_bot(token):
@@ -89,27 +110,6 @@ async def run_bot(token):
         logger.critical(f"Failed to start bot: {e}")
         # Re-raise to ensure the error is visible
         raise
-    
-    # Use provided resources if available
-    if queue is not None:
-        download_queue = queue
-    else:
-        download_queue = queue.Queue(maxsize=MAX_QUEUE_SIZE)
-        
-    if active_downloads_dict is not None:
-        active_downloads = active_downloads_dict
-    else:
-        active_downloads = {}
-        
-    if lock is not None:
-        queue_lock = lock
-    else:
-        queue_lock = threading.Lock()
-        
-    if database is not None:
-        db = database
-    
-    return download_queue, active_downloads, queue_lock
 
 # --------------------------------
 # Telegram Bot Command Handlers
@@ -434,6 +434,11 @@ async def show_freepik_menu(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     
     if db:
         subscription = db.get_active_subscription(user_id, "freepik")
+        
+        # Add debugging code for subscription check
+        is_valid, reason = db.debug_subscription_status(user_id, "freepik")
+        logger.info(f"Subscription check: valid={is_valid}, reason={reason}")
+        
         limit_info = db.get_download_limit(user_id, "freepik")
     
     # Determine subscription status text - with NO FORMATTING at all
@@ -573,6 +578,11 @@ async def prompt_for_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     
     if db:
         subscription = db.get_active_subscription(user_id, "freepik")
+        
+        # Add debugging code for subscription check
+        is_valid, reason = db.debug_subscription_status(user_id, "freepik")
+        logger.info(f"Subscription check in prompt_for_url: valid={is_valid}, reason={reason}")
+        
         has_subscription = subscription is not None
         can_download = db.can_download(user_id, "freepik")
         limit_info = db.get_download_limit(user_id, "freepik")
@@ -669,6 +679,11 @@ async def handle_url(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     
     if db:
         subscription = db.get_active_subscription(user_id, "freepik")
+        
+        # Add debugging for subscription check
+        is_valid, reason = db.debug_subscription_status(user_id, "freepik")
+        logger.info(f"Subscription check in handle_url: valid={is_valid}, reason={reason}")
+        
         has_subscription = subscription is not None
         can_download = db.can_download(user_id, "freepik")
     
@@ -1054,75 +1069,153 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
     # Get the largest photo (best quality)
     photo = update.message.photo[-1]
     
-    # Get file from Telegram
-    photo_file = await context.bot.get_file(photo.file_id)
-    file_url = photo_file.file_path
-    
-    # Get subscription details from context
-    service = context.user_data.get("subscription_service")
-    plan = context.user_data.get("subscription_plan")
-    amount = context.user_data.get("subscription_amount")
-    currency = context.user_data.get("subscription_currency", "LKR")
-    
-    # Save user information in database with enhanced details
-    if db:
-        db.create_or_update_user(
-            user_id=user_id,
-            username=username,
-            name=full_name,
-            first_name=first_name,
-            last_name=last_name,
-            telegram_info={
-                "is_premium": getattr(user, "is_premium", False),
-                "language_code": getattr(user, "language_code", None)
-            }
-        )
-    
-    # Create payment record in database
-    payment_id = None
-    subscription_id = None
-    
     try:
-        # Download the actual image file
-        response = requests.get(file_url)
-        image_data = response.content
+        # First acknowledge receipt to prevent timeout
+        await update.message.reply_text(
+            "📸 Received your payment receipt. Processing...",
+            reply_markup=None
+        )
         
-        # Create a unique filename for the payment receipt
-        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        receipt_filename = f"payment_receipt_{user_id}_{timestamp}.jpg"
+        # Get file from Telegram with increased timeout
+        photo_file = await context.bot.get_file(photo.file_id)
+        file_url = photo_file.file_path
         
-        # Save the image to a local directory
-        receipts_dir = os.path.join("downloads", "payment_receipts")
-        os.makedirs(receipts_dir, exist_ok=True)
-        receipt_path = os.path.join(receipts_dir, receipt_filename)
+        # Get subscription details from context
+        service = context.user_data.get("subscription_service")
+        plan = context.user_data.get("subscription_plan")
+        amount = context.user_data.get("subscription_amount")
+        currency = context.user_data.get("subscription_currency", "LKR")
         
-        with open(receipt_path, "wb") as f:
-            f.write(image_data)
-            
-        # Log the saved file path
-        logger.info(f"Payment receipt saved locally at: {receipt_path}")
-        
+        # Save user information in database with enhanced details
         if db:
-            # Create payment record with enhanced information
-            payment = db.create_payment(
-                user_id=user_id, 
-                amount=amount, 
-                currency=currency,
-                service=service, 
-                plan=plan, 
-                image_url=file_url,
-                image_file_id=photo.file_id,  # Store Telegram file ID
-                image_file_path=receipt_path,  # Store local file path
-                notes=update.message.caption or "",  # Include any caption as notes
-                payment_date=datetime.datetime.utcnow()
+            db.create_or_update_user(
+                user_id=user_id,
+                username=username,
+                name=full_name,
+                first_name=first_name,
+                last_name=last_name,
+                telegram_info={
+                    "is_premium": getattr(user, "is_premium", False),
+                    "language_code": getattr(user, "language_code", None)
+                }
             )
-            payment_id = payment["_id"]
+        
+        # Create payment record in database
+        payment_id = None
+        subscription_id = None
+        
+        # Download the actual image file with timeout handling
+        try:
+            # Use a session with longer timeout
+            import requests
+            from requests.adapters import HTTPAdapter
+            from urllib3.util.retry import Retry
             
-            # Create subscription record linked to payment
-            subscription = db.create_subscription(user_id, service, plan, payment_id)
-            subscription_id = subscription["_id"]
+            session = requests.Session()
+            retry_strategy = Retry(
+                total=3,
+                backoff_factor=1,
+                status_forcelist=[429, 500, 502, 503, 504],
+            )
+            adapter = HTTPAdapter(max_retries=retry_strategy)
+            session.mount("http://", adapter)
+            session.mount("https://", adapter)
+            
+            # Download with extended timeout (30 seconds)
+            response = session.get(file_url, timeout=30)
+            image_data = response.content
+            
+            # Create a unique filename for the payment receipt
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            receipt_filename = f"payment_receipt_{user_id}_{timestamp}.jpg"
+            
+            # Save the image to a local directory
+            receipts_dir = os.path.join("downloads", "payment_receipts")
+            os.makedirs(receipts_dir, exist_ok=True)
+            receipt_path = os.path.join(receipts_dir, receipt_filename)
+            
+            with open(receipt_path, "wb") as f:
+                f.write(image_data)
+                
+            # Log the saved file path
+            logger.info(f"Payment receipt saved locally at: {receipt_path}")
+            
+            if db:
+                # Create payment record with enhanced information
+                payment = db.create_payment(
+                    user_id=user_id, 
+                    amount=amount, 
+                    currency=currency,
+                    service=service, 
+                    plan=plan, 
+                    image_url=file_url,
+                    image_file_id=photo.file_id,  # Store Telegram file ID
+                    image_file_path=receipt_path,  # Store local file path
+                    notes=update.message.caption or "",  # Include any caption as notes
+                    payment_date=datetime.datetime.utcnow()
+                )
+                payment_id = payment["_id"]
+                
+                # Create subscription record linked to payment
+                subscription = db.create_subscription(user_id, service, plan, payment_id)
+                subscription_id = subscription["_id"]
+        except requests.exceptions.Timeout:
+            logger.error(f"Timeout downloading payment receipt image for user {user_id}")
+            await update.message.reply_text(
+                "❌ The image download timed out. Please try sending a smaller image or contact support.",
+                reply_markup=InlineKeyboardMarkup([
+                    [InlineKeyboardButton("Back to Main Menu", callback_data=BACK_MAIN_MENU)]
+                ])
+            )
+            return MAIN_MENU
+        except Exception as e:
+            logger.error(f"Error downloading payment image: {e}")
+            # Fall back to just storing the Telegram file ID
+            if db:
+                payment = db.create_payment(
+                    user_id=user_id, 
+                    amount=amount, 
+                    currency=currency,
+                    service=service, 
+                    plan=plan, 
+                    image_url=file_url,
+                    image_file_id=photo.file_id,
+                    notes=update.message.caption or "",
+                    payment_date=datetime.datetime.utcnow()
+                )
+                payment_id = payment["_id"]
+                
+                # Create subscription record linked to payment
+                subscription = db.create_subscription(user_id, service, plan, payment_id)
+                subscription_id = subscription["_id"]
+        
+        # Clean up context
+        context.user_data.pop("subscription_service", None)
+        context.user_data.pop("subscription_plan", None)
+        context.user_data.pop("subscription_amount", None)
+        context.user_data.pop("subscription_currency", None)
+        context.user_data.pop("subscription_name", None)
+        
+        await update.message.reply_text(
+            "✅ *Payment Proof Received!*\n\n"
+            "Thank you for your payment. Your subscription will be activated after our admin verifies your payment.\n\n"
+            "This usually takes 1-24 hours during business days.\n\n"
+            "You'll receive a notification once your subscription is active.",
+            parse_mode=constants.ParseMode.MARKDOWN,
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("Back to Main Menu", callback_data=BACK_MAIN_MENU)]
+            ])
+        )
+        
+        # Notify admin about new payment in a separate task to avoid timeout
+        context.application.create_task(
+            notify_admin_about_payment(context, user_id, payment_id, service, plan, amount, currency)
+        )
+        
+        return MAIN_MENU
+        
     except Exception as e:
-        logger.error(f"Error processing payment proof: {e}")
+        logger.error(f"Error processing payment proof: {e}", exc_info=True)
         await update.message.reply_text(
             "❌ There was an error processing your payment proof. Please try again later or contact support.",
             reply_markup=InlineKeyboardMarkup([
@@ -1130,32 +1223,9 @@ async def handle_payment_proof(update: Update, context: ContextTypes.DEFAULT_TYP
             ])
         )
         return MAIN_MENU
-    
-    # Clean up context
-    context.user_data.pop("subscription_service", None)
-    context.user_data.pop("subscription_plan", None)
-    context.user_data.pop("subscription_amount", None)
-    context.user_data.pop("subscription_currency", None)
-    context.user_data.pop("subscription_name", None)
-    
-    await update.message.reply_text(
-        "✅ *Payment Proof Received!*\n\n"
-        "Thank you for your payment. Your subscription will be activated after our admin verifies your payment.\n\n"
-        "This usually takes 1-24 hours during business days.\n\n"
-        "You'll receive a notification once your subscription is active.",
-        parse_mode=constants.ParseMode.MARKDOWN,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("Back to Main Menu", callback_data=BACK_MAIN_MENU)]
-        ])
-    )
-    
-    # Notify admin about new payment
-    await notify_admin_about_payment(context, user_id, payment_id, service, plan, amount, currency)
-    
-    return MAIN_MENU
 
 async def notify_admin_about_payment(context, user_id, payment_id, service, plan, amount, currency):
-    """Send notification to admin(s) about new payment."""
+    """Send notification to admin(s) about new payment with better error handling."""
     # Get admin chat IDs from config
     admin_chat_ids = ADMIN_CHAT_IDS
     
@@ -1166,11 +1236,14 @@ async def notify_admin_about_payment(context, user_id, payment_id, service, plan
     # Get user details from database
     user_info = ""
     if db:
-        user = db.get_user(user_id)
-        if user:
-            username = user.get("username", "No username")
-            name = user.get("name", "Unknown")
-            user_info = f"Username: @{username}\nName: {name}\n"
+        try:
+            user = db.get_user(user_id)
+            if user:
+                username = user.get("username", "No username")
+                name = user.get("name", "Unknown")
+                user_info = f"Username: @{username}\nName: {name}\n"
+        except Exception as e:
+            logger.error(f"Error getting user info for notification: {e}")
     
     # Format notification message
     formatted_amount = f"{amount:,}"
@@ -1206,16 +1279,27 @@ async def notify_admin_about_payment(context, user_id, payment_id, service, plan
                 )
                 logger.info(f"Payment notification sent to admin {admin_id}")
                 
-                # Also send the actual payment receipt image
+                # Send the payment receipt image separately with error handling
                 if db:
-                    payment = db.get_payment(payment_id)
-                    if payment and "image_file_id" in payment:
-                        await context.bot.send_photo(
-                            chat_id=int(admin_id),
-                            photo=payment["image_file_id"],
-                            caption=f"Payment receipt for Payment ID: {payment_id}"
-                        )
-                        logger.info(f"Payment receipt image sent to admin {admin_id}")
+                    try:
+                        payment = db.get_payment(payment_id)
+                        if payment and "image_file_id" in payment:
+                            await context.bot.send_photo(
+                                chat_id=int(admin_id),
+                                photo=payment["image_file_id"],
+                                caption=f"Payment receipt for Payment ID: {payment_id}"
+                            )
+                            logger.info(f"Payment receipt image sent to admin {admin_id}")
+                    except Exception as img_error:
+                        logger.error(f"Error sending payment image to admin {admin_id}: {img_error}")
+                        # Try to send a message about the error
+                        try:
+                            await context.bot.send_message(
+                                chat_id=int(admin_id),
+                                text=f"Failed to send payment receipt image: {img_error}"
+                            )
+                        except:
+                            pass
         except Exception as e:
             logger.error(f"Failed to send payment notification to admin {admin_id}: {e}")
 
@@ -1578,13 +1662,27 @@ def setup_bot_handlers(application):
     # Add error handler to catch and log exceptions
     async def error_handler(update, context):
         """Log errors caused by Updates."""
-        logger.error(f"Update {update} caused error: {context.error}")
-        if update and update.effective_chat:
-            # Notify user that an error occurred
-            await context.bot.send_message(
-                chat_id=update.effective_chat.id,
-                text="An error occurred while processing your request. Please try again later."
-            )
+        if isinstance(context.error, TimeoutError):
+            logger.error(f"Timeout error processing update: {update}")
+            if update and update.effective_chat:
+                try:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="⚠️ The operation timed out. Please try again or use a smaller image."
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending timeout message: {e}")
+        else:
+            logger.error(f"Update {update} caused error: {context.error}", exc_info=context.error)
+            if update and update.effective_chat:
+                # Notify user that an error occurred
+                try:
+                    await context.bot.send_message(
+                        chat_id=update.effective_chat.id,
+                        text="An error occurred while processing your request. Please try again later."
+                    )
+                except Exception as e:
+                    logger.error(f"Error sending error message: {e}")
     
     # Define conversation handler
     conv_handler = ConversationHandler(

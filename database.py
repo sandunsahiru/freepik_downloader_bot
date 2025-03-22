@@ -596,20 +596,120 @@ class Database:
             result = self.db.users.insert_one(user)
             logger.info(f"Created new user {user_id} in MongoDB with ID: {result.inserted_id}")
             return user
+
+    def debug_subscription_status(self, user_id, service):
+        """Debug why a subscription isn't being recognized."""
+        now = datetime.datetime.utcnow()
+        logger.info(f"DEBUG: Checking subscription for user_id={user_id}, service={service}, current time={now}")
+        
+        # If using MongoDB
+        if self.is_connected:
+            # Check if the subscription exists
+            subscription = self.db.subscriptions.find_one({
+                "user_id": user_id,
+                "service": service
+            })
+            
+            if not subscription:
+                logger.info(f"DEBUG: No subscription found for user_id={user_id}, service={service}")
+                return False, "No subscription found"
+                
+            logger.info(f"DEBUG: Found subscription: {subscription}")
+            
+            # Check if subscription is active
+            if subscription.get("status") != "active":
+                logger.info(f"DEBUG: Subscription status is '{subscription.get('status')}', not 'active'")
+                return False, f"Status is {subscription.get('status')}"
+            
+            # Check if subscription is expired
+            end_date = subscription.get("end_date")
+            if not end_date:
+                logger.info("DEBUG: Subscription has no end_date")
+                return False, "No end_date"
+                
+            if end_date <= now:
+                logger.info(f"DEBUG: Subscription expired on {end_date}")
+                return False, f"Expired on {end_date}"
+                
+            # If we get here, subscription should be valid
+            logger.info(f"DEBUG: Subscription is valid until {end_date}")
+            return True, f"Valid until {end_date}"
+        else:
+            # Check in mock database
+            for sub in self.mock_db.subscriptions:
+                if sub["user_id"] == user_id and sub["service"] == service:
+                    logger.info(f"DEBUG: Found mock subscription: {sub}")
+                    
+                    if sub.get("status") != "active":
+                        logger.info(f"DEBUG: Mock subscription status is '{sub.get('status')}', not 'active'")
+                        return False, f"Status is {sub.get('status')}"
+                    
+                    end_date = sub.get("end_date")
+                    if not end_date:
+                        logger.info("DEBUG: Mock subscription has no end_date")
+                        return False, "No end_date"
+                        
+                    if end_date <= now:
+                        logger.info(f"DEBUG: Mock subscription expired on {end_date}")
+                        return False, f"Expired on {end_date}"
+                        
+                    logger.info(f"DEBUG: Mock subscription is valid until {end_date}")
+                    return True, f"Valid until {end_date}"
+                    
+            logger.info(f"DEBUG: No mock subscription found for user_id={user_id}, service={service}")
+            return False, "No subscription found"
+
+    # Add this function to check user_id type consistency
+    def ensure_user_id_type_consistency(self, user_id):
+        """Make sure user_id is consistently handled as an integer."""
+        try:
+            # Convert to int if it's not already
+            user_id_int = int(user_id)
+            logger.info(f"Converted user_id from {type(user_id)} to int: {user_id_int}")
+            return user_id_int
+        except (ValueError, TypeError):
+            logger.error(f"Failed to convert user_id {user_id} to int")
+            return user_id
     
     # Subscription Management
     def get_active_subscription(self, user_id, service):
         return self._call_method("get_active_subscription", user_id, service)
         
     def _real_get_active_subscription(self, user_id, service):
+        """Get active subscription for a user for a specific service."""
         now = datetime.datetime.utcnow()
+        
+        # Ensure user_id is an integer
+        user_id = self.ensure_user_id_type_consistency(user_id)
+        
+        # Log debugging information
+        logger.info(f"Getting active subscription for user_id={user_id}, service={service}, time={now}")
+        
+        # First, try with proper query
         result = self.db.subscriptions.find_one({
             "user_id": user_id,
             "service": service,
             "end_date": {"$gt": now},
             "status": "active"
         })
-        logger.debug(f"Get active subscription for user {user_id}, service {service}: {'Found' if result else 'Not found'}")
+        
+        if result:
+            logger.info(f"Found active subscription for user {user_id} with ID {result.get('_id')}")
+        else:
+            # Try finding with looser query to debug the issue
+            all_subs = list(self.db.subscriptions.find({"user_id": user_id}))
+            if all_subs:
+                logger.info(f"User {user_id} has {len(all_subs)} subscriptions, but none match active criteria")
+                for i, sub in enumerate(all_subs):
+                    logger.info(f"Subscription {i+1}: service={sub.get('service')}, status={sub.get('status')}, end_date={sub.get('end_date')}")
+                    if sub.get('service') == service:
+                        if sub.get('status') != 'active':
+                            logger.info(f"  - Status issue: {sub.get('status')} != 'active'")
+                        if 'end_date' in sub and sub['end_date'] <= now:
+                            logger.info(f"  - Date issue: {sub['end_date']} <= {now}")
+            else:
+                logger.info(f"No subscriptions found for user {user_id}")
+        
         return result
     
     def get_all_user_subscriptions(self, user_id):
