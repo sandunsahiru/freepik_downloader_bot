@@ -4,3 +4,4 @@ __pycache__/
 auth_state.json
 *.log
 downloads/
+.DS_Store
